@@ -1,5 +1,5 @@
 // Aseprite
-// Copyright (C) 2019-2021  Igara Studio S.A.
+// Copyright (C) 2019-2022  Igara Studio S.A.
 // Copyright (C) 2001-2018  David Capello
 //
 // This program is distributed under the terms of
@@ -280,6 +280,11 @@ void PixelsMovement::setTransformationBase(const Transformation& t)
     fullBounds |= gfx::Rect((int)newCorners[i].x, (int)newCorners[i].y, 1, 1);
   }
 
+  // This align is done to properly invalidate regions on the editor when
+  // partial tiles are selected in the transform bounds
+  if (m_site.tilemapMode() == TilemapMode::Tiles)
+    fullBounds = m_site.grid().alignBounds(fullBounds);
+
   // If "fullBounds" is empty is because the cel was not moved
   if (!fullBounds.isEmpty()) {
     // Notify the modified region.
@@ -369,6 +374,10 @@ void PixelsMovement::moveImage(const gfx::PointF& pos, MoveModifier moveModifier
   gfx::RectF bounds = m_initialData.bounds();
   gfx::PointF abs_initial_pivot = m_initialData.pivot();
   gfx::PointF abs_pivot = m_currentData.pivot();
+  const bool tilemapMode = m_site.tilemapMode() == TilemapMode::Tiles;
+  const bool tilemapModeOrSnapToGrid =
+    (tilemapMode && m_site.layer()->isTilemap()) ||
+    (moveModifier & SnapToGridMovement) == SnapToGridMovement;
 
   auto newTransformation = m_currentData;
 
@@ -377,6 +386,18 @@ void PixelsMovement::moveImage(const gfx::PointF& pos, MoveModifier moveModifier
     case MovePixelsHandle: {
       double dx = (pos.x - m_catchPos.x);
       double dy = (pos.y - m_catchPos.y);
+      if (tilemapModeOrSnapToGrid) {
+        if (m_catchPos.x == 0 && m_catchPos.y == 0) {
+          // Movement through keyboard:
+          dx *= m_site.gridBounds().w;
+          dy *= m_site.gridBounds().h;
+        }
+        else {
+          // Movement through mouse/trackpad:
+          dx = double(int(dx) / m_site.gridBounds().w * m_site.gridBounds().w);
+          dy = double(int(dy) / m_site.gridBounds().h * m_site.gridBounds().h);
+        }
+      }
       if ((moveModifier & FineControl) == 0) {
         if (dx >= 0.0) { dx = std::floor(dx); } else { dx = std::ceil(dx); }
         if (dy >= 0.0) { dy = std::floor(dy); } else { dy = std::ceil(dy); }
@@ -388,28 +409,9 @@ void PixelsMovement::moveImage(const gfx::PointF& pos, MoveModifier moveModifier
         else
           dy = 0.0;
       }
-
       bounds.offset(dx, dy);
-
-      if ((m_site.tilemapMode() == TilemapMode::Tiles) ||
-          (moveModifier & SnapToGridMovement) == SnapToGridMovement) {
-        // Snap the x1,y1 point to the grid.
-        gfx::Rect gridBounds = m_site.gridBounds();
-        gfx::PointF gridOffset(
-          snap_to_grid(
-            gridBounds,
-            gfx::Point(bounds.origin()),
-            PreferSnapTo::ClosestGridVertex));
-
-        // Now we calculate the difference from x1,y1 point and we can
-        // use it to adjust all coordinates (x1, y1, x2, y2).
-        bounds.setOrigin(gridOffset);
-      }
-
       newTransformation.bounds(bounds);
-      newTransformation.pivot(abs_initial_pivot +
-                              bounds.origin() -
-                              m_initialData.bounds().origin());
+      newTransformation.pivot(abs_initial_pivot + gfx::PointF(dx, dy));
       break;
     }
 
@@ -492,10 +494,34 @@ void PixelsMovement::moveImage(const gfx::PointF& pos, MoveModifier moveModifier
       }
 
       // Snap to grid when resizing tilemaps
-      if (m_site.tilemapMode() == TilemapMode::Tiles) {
-        gfx::Rect gridBounds = m_site.gridBounds();
-        a = gfx::PointF(snap_to_grid(gridBounds, gfx::Point(a), PreferSnapTo::BoxOrigin));
-        b = gfx::PointF(snap_to_grid(gridBounds, gfx::Point(b), PreferSnapTo::BoxOrigin));
+      if (tilemapMode) {
+        // Most right-bottom pixel adjust
+        a.x = a.x - (a.x > b.x? 1 : 0);
+        a.y = a.y - (a.y > b.y? 1 : 0);
+        b.x = b.x - (a.x <= b.x? 1 : 0);
+        b.y = b.y - (a.y <= b.y? 1 : 0);
+        // Snap to tilemap grid
+        gfx::RectF alignedRect(m_site.grid().alignBounds(gfx::RectF(a, gfx::SizeF(1, 1)) |
+                                                         gfx::RectF(b, gfx::SizeF(1, 1))));
+        // We want to keep a rectangle with negative width or
+        // height (to know that it was flipped).
+        // TO DO: implement flips on tilemaps.
+        if (a.x <= b.x) {
+          a.x = alignedRect.x;
+          b.x = alignedRect.x2();
+        }
+        else {
+          a.x = alignedRect.x2();
+          b.x = alignedRect.x;
+        }
+        if (a.y <= b.y) {
+          a.y = alignedRect.y;
+          b.y = alignedRect.y2();
+        }
+        else {
+          a.y = alignedRect.y2();
+          b.y = alignedRect.y;
+        }
       }
 
       // Do not use "gfx::Rect(a, b)" here because if a > b we want to
@@ -517,7 +543,7 @@ void PixelsMovement::moveImage(const gfx::PointF& pos, MoveModifier moveModifier
     case RotateSEHandle: {
       // Cannot rotate tiles
       // TODO add support to rotate tiles in straight angles (changing tile flags)
-      if (m_site.tilemapMode() == TilemapMode::Tiles)
+      if (tilemapMode)
         break;
 
       double da = (std::atan2((double)(-pos.y + abs_pivot.y),
@@ -560,7 +586,7 @@ void PixelsMovement::moveImage(const gfx::PointF& pos, MoveModifier moveModifier
       // Cannot skew tiles
       // TODO could we support to skew tiles if we have the set of tiles (e.g. diagonals)?
       //      maybe too complex to implement in UI terms
-      if (m_site.tilemapMode() == TilemapMode::Tiles)
+      if (tilemapMode)
         break;
 
       //    u
@@ -712,6 +738,7 @@ void PixelsMovement::moveImage(const gfx::PointF& pos, MoveModifier moveModifier
 void PixelsMovement::getDraggedImageCopy(std::unique_ptr<Image>& outputImage,
                                          std::unique_ptr<Mask>& outputMask)
 {
+  ASSERT(!(m_site.tilemapMode() == TilemapMode::Tiles && !m_site.layer()->isTilemap()));
   gfx::Rect bounds = m_currentData.transformedBounds();
   if (bounds.isEmpty())
     return;
@@ -759,6 +786,35 @@ void PixelsMovement::getDraggedImageCopy(std::unique_ptr<Image>& outputImage,
   outputMask.reset(mask.release());
 }
 
+void PixelsMovement::alignMasksAndTransformData(
+  const Mask* initialMask0,
+  const Mask* initialMask,
+  const Mask* currentMask,
+  const Transformation* initialData,
+  const Transformation* currentData,
+  const doc::Grid& grid,
+  const gfx::SizeF& initialScaleRatio)
+{
+  // Masks alignment
+  m_initialMask0->replace(grid.makeAlignedMask(initialMask0));
+  m_initialMask->replace(grid.makeAlignedMask(initialMask));
+  m_currentMask->replace(grid.makeAlignedMask(currentMask));
+  // Initial data copy and alignment
+  m_initialData = *initialData;
+  gfx::RectF iniBounds = m_initialMask0->bounds();
+  m_initialData.bounds(iniBounds);
+  // Current data copy and alignment.
+  // Raw alignment of initialData and currentData to the grid can result in
+  // unintentional scaling. That's why we need to know if the artist's intention
+  // was just to move the selection (via 'scale ratio').
+  m_currentData = *currentData;
+  gfx::RectF currBounds = grid.alignBounds(currentData->bounds());
+  m_currentData.bounds(
+    gfx::RectF(currBounds.x, currBounds.y,
+               initialScaleRatio.w == 1.0 ? iniBounds.w : currBounds.w,
+               initialScaleRatio.h == 1.0 ? iniBounds.h : currBounds.h));
+}
+
 void PixelsMovement::stampImage()
 {
   stampImage(false);
@@ -791,6 +847,21 @@ void PixelsMovement::stampImage(bool finalStamp)
     stampExtraCelImage();
   }
 
+  // Saving original values before the 'for' loop and
+  // 'reproduceAllTransformationsWithInnerCmds' for restoring later.
+  // All these values will changed during the transformation reproduction.
+  TilemapMode originalSiteTilemapMode = (m_site.tilemapMode() == TilemapMode::Tiles &&
+                                         m_site.layer()->isTilemap()? TilemapMode::Tiles : TilemapMode::Pixels);
+  TilesetMode originalSiteTilesetMode = m_site.tilesetMode();
+  auto initialMask0 = std::make_unique<Mask>(*m_initialMask0);
+  auto initialMask  = std::make_unique<Mask>(*m_initialMask);
+  auto currentMask  = std::make_unique<Mask>(*m_currentMask);
+  auto initialData  = std::make_unique<Transformation>(m_initialData);
+  auto currentData  = std::make_unique<Transformation>(m_currentData);
+
+  gfx::SizeF initialScaleRatio(double(m_currentData.bounds().w) / double(m_initialData.bounds().w),
+                               double(m_currentData.bounds().h) / double(m_initialData.bounds().h));
+
   for (Cel* target : cels) {
     // We'll re-create the transformation for the other cels
     if (target != currentCel) {
@@ -798,7 +869,35 @@ void PixelsMovement::stampImage(bool finalStamp)
       m_site.layer(target->layer());
       m_site.frame(target->frame());
       ASSERT(m_site.cel() == target);
-
+      Grid targetGrid = m_site.grid();
+      // Align masks and transformData before to 'reproduceAllTransformationsWithInnerCmds'
+      // Note: this alignement is needed only when the editor is on 'TilemapMode::Tiles',
+      // on the other hand 'TilemapMode::Pixels' do not require any additional
+      // mask/transformData adjustments.
+      if (originalSiteTilemapMode == TilemapMode::Tiles) {
+        if (target->layer()->isTilemap()) {
+          alignMasksAndTransformData(initialMask0.get(),
+                                     initialMask.get(),
+                                     currentMask.get(),
+                                     initialData.get(),
+                                     currentData.get(),
+                                     targetGrid,
+                                     initialScaleRatio);
+          m_site.tilemapMode(TilemapMode::Tiles);
+        }
+        else {
+          m_initialMask0->replace(*initialMask0.get());
+          m_initialMask->replace(*initialMask.get());
+          m_currentMask->replace(*currentMask.get());
+          m_initialData.bounds(initialData.get()->bounds());
+          m_currentData.bounds(currentData.get()->bounds());
+          m_site.tilemapMode(TilemapMode::Pixels);
+        }
+      }
+      else {
+        m_site.tilemapMode(TilemapMode::Pixels);
+        m_site.tilesetMode(TilesetMode::Auto);
+      }
       reproduceAllTransformationsWithInnerCmds();
     }
 
@@ -806,12 +905,20 @@ void PixelsMovement::stampImage(bool finalStamp)
     stampExtraCelImage();
   }
 
+  m_initialMask0->replace(*initialMask0.get());
+  m_initialMask->replace(*initialMask.get());
+  m_currentMask->replace(*currentMask.get());
+  m_initialData.bounds(initialData.get()->bounds());
+  m_currentData.bounds(currentData.get()->bounds());
+  m_site.tilesetMode(originalSiteTilesetMode);
   currentCel = m_site.cel();
   if (currentCel &&
       (m_site.layer() != currentCel->layer() ||
        m_site.frame() != currentCel->frame())) {
     m_site.layer(currentCel->layer());
     m_site.frame(currentCel->frame());
+    m_site.tilemapMode(originalSiteTilemapMode);
+    m_site.tilesetMode(originalSiteTilesetMode);
     redrawExtraImage();
   }
 }
@@ -988,6 +1095,7 @@ void PixelsMovement::redrawExtraImage(Transformation* transformation)
   if (!m_extraCel)
     m_extraCel.reset(new ExtraCel);
 
+  ASSERT(!(m_site.tilemapMode() == TilemapMode::Tiles && !m_site.layer()->isTilemap()));
   gfx::Rect bounds = transformation->transformedBounds();
 
   if (!bounds.isEmpty()) {
@@ -995,6 +1103,7 @@ void PixelsMovement::redrawExtraImage(Transformation* transformation)
     if (m_site.tilemapMode() == TilemapMode::Tiles) {
       // Transforming tiles
       extraCelSize = m_site.grid().canvasToTile(bounds).size();
+      bounds = m_site.grid().alignBounds(bounds);
     }
     else {
       // Transforming pixels
@@ -1041,7 +1150,7 @@ void PixelsMovement::drawImage(
   auto corners = transformation.transformedCorners();
   gfx::Rect bounds = corners.bounds(transformation.cornerThick());
 
-  if (m_site.tilemapMode() == TilemapMode::Tiles) {
+  if (m_site.tilemapMode() == TilemapMode::Tiles && m_site.layer()->isTilemap()) {
     dst->setMaskColor(doc::notile);
     dst->clear(dst->maskColor());
 
@@ -1403,10 +1512,17 @@ void PixelsMovement::reproduceAllTransformationsWithInnerCmds()
 
   m_document->setMask(m_initialMask0.get());
   m_initialMask->copyFrom(m_initialMask0.get());
-  m_originalImage.reset(
+  if (m_site.layer()->isTilemap() && m_site.tilemapMode() == TilemapMode::Tiles) {
+    m_originalImage.reset(
+    new_tilemap_from_mask(
+      m_site, m_initialMask0.get()));
+  }
+  else {
+    m_originalImage.reset(
     new_image_from_mask(
-      m_site, m_initialMask.get(),
+      m_site, m_initialMask0.get(),
       Preferences::instance().experimental.newBlend()));
+  }
 
   for (const InnerCmd& c : m_innerCmds) {
     switch (c.type) {
